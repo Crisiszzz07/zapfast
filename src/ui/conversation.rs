@@ -21,8 +21,6 @@ use crate::theme::{self, Icon, Palette};
 
 use super::widgets;
 
-/// Maximum automatic attachment download size.
-const AUTO_DOWNLOAD_LIMIT: u64 = 64 * 1024 * 1024;
 /// Group-message avatar size.
 const SENDER_AVATAR: f32 = 28.0;
 const BODY_SIZE: f32 = 14.5;
@@ -3089,7 +3087,8 @@ fn picture(
         && !matches!(media.state, MediaState::Downloading);
     let auto = ui.is_rect_visible(rect)
         && matches!(media.state, MediaState::Idle)
-        && (sticker.is_some() || (view.auto_download && media.size <= AUTO_DOWNLOAD_LIMIT));
+        && view.auto_download
+        && media.is_within_download_limit();
     if wants || auto {
         actions.push(Action::Download {
             chat: view.chat.id.clone(),
@@ -3209,7 +3208,7 @@ fn video(
         && media.path.is_none()
         && matches!(media.state, MediaState::Idle)
         && view.auto_download
-        && media.size <= AUTO_DOWNLOAD_LIMIT;
+        && media.is_within_download_limit();
     if auto {
         actions.push(Action::Download {
             chat: view.chat.id.clone(),
@@ -3304,7 +3303,7 @@ fn attachment(
         && media.path.is_none()
         && matches!(media.state, MediaState::Idle)
         && view.auto_download
-        && media.size <= AUTO_DOWNLOAD_LIMIT;
+        && media.is_within_download_limit();
     if auto {
         actions.push(Action::Download {
             chat: view.chat.id.clone(),
@@ -3564,7 +3563,7 @@ fn voice_player(
     let auto = media.path.is_none()
         && matches!(media.state, MediaState::Idle)
         && view.auto_download
-        && media.size <= AUTO_DOWNLOAD_LIMIT;
+        && media.is_within_download_limit();
     if auto {
         actions.push(Action::Download {
             chat: view.chat.id.clone(),

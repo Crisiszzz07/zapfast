@@ -44,7 +44,7 @@ Changes on the Settings page are saved to `settings.json` immediately:
 
 - **Theme**: light, dark, or follow the system.
 - **Enter sends**: swap Enter and Shift+Enter.
-- **Download attachments automatically**: download files up to 64 MB when
+- **Download attachments automatically**: download files up to 64 MiB when
   they enter view, or only when clicked.
 - **Show sender pictures**: avatars next to group messages.
 - **Names from your address book**: use contact names everywhere. When off,

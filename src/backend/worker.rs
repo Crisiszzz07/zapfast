@@ -4,6 +4,7 @@
 //! canonicalized to phone-number ids as soon as their mapping is known.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +28,7 @@ use whatsapp_rust::types::events as wa_events;
 use whatsapp_rust::types::message::{MessageInfo, MessageSource};
 use whatsapp_rust::types::presence::{ChatPresence, ReceiptType};
 use whatsapp_rust::upload::UploadOptions;
-use whatsapp_rust::wacore::download::Downloadable;
+use whatsapp_rust::wacore::download::{DownloadWriter, Downloadable};
 use whatsapp_rust::wacore::history_sync::{HistorySyncStream, MAX_DECOMPRESSED};
 use whatsapp_rust::wacore::store::DevicePropsOverride;
 use whatsapp_rust::wacore_binary::jid::JidExt;
@@ -41,8 +42,8 @@ use super::{Command, Event, LinkStatus, Waker, read_sync::ReadSync};
 use crate::app::PAGE;
 use crate::archive::Archive;
 use crate::model::{
-    Chat, ChatId, ChatKind, Contact, Content, Delivery, Gif, GifError, LinkPreview, Media,
-    MentionRef, Message, Quoted, Reaction,
+    ATTACHMENT_DOWNLOAD_LIMIT, Chat, ChatId, ChatKind, Contact, Content, Delivery, Gif, GifError,
+    LinkPreview, Media, MentionRef, Message, Quoted, Reaction,
 };
 use crate::paths::AppDirs;
 
@@ -60,6 +61,87 @@ const ON_DEMAND: i32 = 6;
 const THUMBNAIL_SIDE: u32 = 96;
 /// Sticker download batch size for the picker.
 const STICKER_FETCH_LIMIT: usize = 40;
+const ATTACHMENT_LIMIT_ERROR: &str = "This attachment is larger than the 64 MiB download limit";
+
+/// A streaming download sink that refuses to grow beyond the attachment limit.
+///
+/// WhatsApp's declared file length is useful to reject an oversized attachment
+/// before connecting, but it is not trusted as the enforcement point.
+struct LimitedWriter<W> {
+    inner: W,
+    limit: u64,
+}
+
+impl<W> LimitedWriter<W> {
+    fn new(inner: W, limit: u64) -> Self {
+        Self { inner, limit }
+    }
+}
+
+impl<W: Write + Seek> Write for LimitedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let position = self.inner.stream_position()?;
+        let remaining = self.limit.saturating_sub(position);
+        if bytes.len() as u64 > remaining {
+            return Err(io::Error::other(ATTACHMENT_LIMIT_ERROR));
+        }
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<W: Seek> Seek for LimitedWriter<W> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+impl<W: DownloadWriter> DownloadWriter for LimitedWriter<W> {
+    fn truncate(&mut self, len: u64) -> io::Result<()> {
+        self.inner.truncate(len)
+    }
+}
+
+fn attachment_is_too_large(size: Option<u64>) -> bool {
+    size.is_some_and(|size| size > ATTACHMENT_DOWNLOAD_LIMIT)
+}
+
+/// Streams a verified attachment to disk without accepting more than 64 MiB.
+async fn download_attachment(
+    client: &Client,
+    downloadable: &dyn Downloadable,
+    dir: &Path,
+    path: &Path,
+) -> Result<PathBuf, String> {
+    if attachment_is_too_large(downloadable.file_length()) {
+        return Err(ATTACHMENT_LIMIT_ERROR.to_owned());
+    }
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|error| error.to_string())?;
+    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    let result = client
+        .download_to_writer(
+            downloadable,
+            LimitedWriter::new(file, ATTACHMENT_DOWNLOAD_LIMIT),
+        )
+        .await;
+    match result {
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(path).await;
+            let error = error.to_string();
+            if error.contains(ATTACHMENT_LIMIT_ERROR) {
+                Err(ATTACHMENT_LIMIT_ERROR.to_owned())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
 
 fn account_allows_receipts(
     settings: &whatsapp_rust::wacore::iq::privacy::PrivacySettingsResponse,
@@ -3357,6 +3439,14 @@ impl Worker {
                 });
                 return;
             };
+        if attachment_is_too_large(downloadable.file_length()) {
+            self.emit(Event::Media {
+                chat,
+                message: id,
+                result: Err(ATTACHMENT_LIMIT_ERROR.to_owned()),
+            });
+            return;
+        }
         // Keep metadata needed for one media re-upload request and retry.
         let media_key = base
             .image_message
@@ -3427,21 +3517,9 @@ impl Worker {
         let dir = self.dirs.media_cache_dir();
         let commands = self.commands.clone();
         tokio::spawn(async move {
-            let keep = |bytes: Vec<u8>| {
-                let dir = dir.clone();
-                let path = media_path(&dir, &chat, &id, &mime, file_name.as_deref());
-                async move {
-                    tokio::fs::create_dir_all(&dir)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    tokio::fs::write(&path, &bytes)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(path)
-                }
-            };
-            let result = match client.download(&*downloadable).await {
-                Ok(bytes) => keep(bytes).await,
+            let path = media_path(&dir, &chat, &id, &mime, file_name.as_deref());
+            let result = match download_attachment(&client, &*downloadable, &dir, &path).await {
+                Ok(path) => Ok(path),
                 Err(error) => {
                     let text = error.to_string();
                     let expired = ["403", "404", "410"].iter().any(|code| text.contains(code));
@@ -3458,10 +3536,9 @@ impl Worker {
                             match client.media_reupload().request(&request).await {
                                 Ok(MediaRetryResult::Success { direct_path }) => {
                                     match refreshed(direct_path) {
-                                        Some(again) => match client.download(&*again).await {
-                                            Ok(bytes) => keep(bytes).await,
-                                            Err(error) => Err(error.to_string()),
-                                        },
+                                        Some(again) => {
+                                            download_attachment(&client, &*again, &dir, &path).await
+                                        }
                                         None => Err(text),
                                     }
                                 }
@@ -3503,24 +3580,20 @@ impl Worker {
                 self.sticker_fetches.remove(&sticker.hash);
                 continue;
             };
+            if attachment_is_too_large(meta.file_length) {
+                self.sticker_fetches.remove(&sticker.hash);
+                log::info!("recent sticker exceeds the attachment download limit");
+                continue;
+            }
             let client = client.clone();
             let commands = self.commands.clone();
             let dir = dir.clone();
             let hash = sticker.hash;
             tokio::spawn(async move {
                 let result = async {
-                    let bytes = client
-                        .download(&PhoneSticker(meta))
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    tokio::fs::create_dir_all(&dir)
-                        .await
-                        .map_err(|error| error.to_string())?;
                     let path = dir.join(format!("{hash}.webp"));
-                    tokio::fs::write(&path, &bytes)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(path)
+                    let sticker = PhoneSticker(meta);
+                    download_attachment(&client, &sticker, &dir, &path).await
                 }
                 .await;
                 let _ = commands.send(Command::StickerFetched { hash, result });
@@ -5505,6 +5578,7 @@ fn ensure_message_secret(raw: Vec<u8>, secret: Option<&[u8]>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn fallback_names_read_as_phones_or_ids() {
@@ -5514,6 +5588,28 @@ mod tests {
         );
         assert_eq!(fallback_name("1-2@g.us"), "Group");
         assert_eq!(fallback_name("42@lid"), "42");
+    }
+
+    #[test]
+    fn limited_writer_never_grows_past_its_cap() {
+        let mut writer = LimitedWriter::new(Cursor::new(Vec::new()), 3);
+        writer.write_all(b"abc").expect("writes through the cap");
+        let error = writer
+            .write_all(b"d")
+            .expect_err("rejects bytes past the cap");
+        assert_eq!(error.to_string(), ATTACHMENT_LIMIT_ERROR);
+        writer.truncate(0).expect("clears a failed attempt");
+        writer
+            .seek(SeekFrom::Start(0))
+            .expect("rewinds after clearing");
+        writer.write_all(b"xyz").expect("can retry after clearing");
+    }
+
+    #[test]
+    fn attachment_limit_rejects_only_oversized_metadata() {
+        assert!(!attachment_is_too_large(None));
+        assert!(!attachment_is_too_large(Some(ATTACHMENT_DOWNLOAD_LIMIT)));
+        assert!(attachment_is_too_large(Some(ATTACHMENT_DOWNLOAD_LIMIT + 1)));
     }
 
     #[test]
