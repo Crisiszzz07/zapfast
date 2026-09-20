@@ -122,7 +122,7 @@ async fn download_attachment(
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|error| error.to_string())?;
-    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    let (temporary, file) = temporary_attachment_file(path)?;
     let result = client
         .download_to_writer(
             downloadable,
@@ -130,15 +130,87 @@ async fn download_attachment(
         )
         .await;
     match result {
-        Ok(_) => Ok(path.to_path_buf()),
+        Ok(_) => match publish_attachment(&temporary, path).await {
+            Ok(()) => Ok(path.to_path_buf()),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                Err(error.to_string())
+            }
+        },
         Err(error) => {
-            let _ = tokio::fs::remove_file(path).await;
+            let _ = tokio::fs::remove_file(&temporary).await;
             let error = error.to_string();
             if error.contains(ATTACHMENT_LIMIT_ERROR) {
                 Err(ATTACHMENT_LIMIT_ERROR.to_owned())
             } else {
                 Err(error)
             }
+        }
+    }
+}
+
+/// Publishes a complete attachment only after its download has been verified.
+async fn publish_attachment(temporary: &Path, path: &Path) -> Result<(), String> {
+    // Windows does not replace an existing destination during rename. A stale
+    // cache file has no archive reference, and active downloads are deduplicated.
+    #[cfg(windows)]
+    if path.exists() {
+        tokio::fs::remove_file(path)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    tokio::fs::rename(temporary, path)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// A hidden, per-attempt path in the destination directory, so a verified
+/// download can replace the cache file atomically.
+fn temporary_attachment_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("media");
+    path.with_file_name(format!(".{name}.{:016x}.part", rand::random::<u64>()))
+}
+
+/// Creates an exclusive temporary file, retrying a vanishingly unlikely name
+/// collision without ever opening another download's staging file.
+fn temporary_attachment_file(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
+    for _ in 0..8 {
+        let temporary = temporary_attachment_path(path);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("Could not create a unique attachment staging file".to_owned())
+}
+
+/// Removes incomplete, unreferenced downloads left by an interrupted process.
+fn discard_attachment_staging(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            log::warn!("could not list attachment staging files: {error}");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.')
+            && name.ends_with(".part")
+            && entry.path().is_file()
+            && let Err(error) = std::fs::remove_file(entry.path())
+        {
+            log::warn!("could not remove incomplete attachment: {error}");
         }
     }
 }
@@ -293,6 +365,7 @@ pub async fn run(
         pending_avatars: HashMap::new(),
         sticker_fetches: HashSet::new(),
         sticker_downloads: HashSet::new(),
+        downloads: HashSet::new(),
         read_sync: ReadSync::default(),
         poll_decrypting: 0,
         poll_history: Default::default(),
@@ -301,6 +374,8 @@ pub async fn run(
     worker.load_state();
     worker.backfill();
     worker.relocate_media();
+    discard_attachment_staging(&worker.dirs.media_cache_dir());
+    discard_attachment_staging(&worker.dirs.sticker_cache_dir());
     worker.start_bot().await;
     let mut wa_events = wa_events;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -382,6 +457,8 @@ struct Worker {
     sticker_fetches: HashSet<String>,
     /// Active chat-sticker downloads by chat and message id.
     sticker_downloads: HashSet<(ChatId, String)>,
+    /// Active attachment downloads by chat and message id.
+    downloads: HashSet<(ChatId, String)>,
 }
 
 /// Decoded history chunk waiting to be canonicalized and archived.
@@ -3365,21 +3442,20 @@ impl Worker {
     }
 
     fn download(&mut self, chat: ChatId, id: String) {
+        if !self.downloads.insert((chat.clone(), id.clone())) {
+            return;
+        }
         let Some(client) = self.client.clone() else {
-            self.emit(Event::Media {
-                chat,
-                message: id,
-                result: Err("Not connected to WhatsApp".to_owned()),
-            });
+            self.downloaded(chat, id, Err("Not connected to WhatsApp".to_owned()));
             return;
         };
         let raw = self.archive.raw(&chat, &id).ok().flatten();
         let Some(message) = raw.and_then(|raw| wa::Message::decode_from_slice(&raw).ok()) else {
-            self.emit(Event::Media {
+            self.downloaded(
                 chat,
-                message: id,
-                result: Err("Attachment download keys are missing".to_owned()),
-            });
+                id,
+                Err("Attachment download keys are missing".to_owned()),
+            );
             return;
         };
         let base = message.get_base_message().clone();
@@ -3419,11 +3495,11 @@ impl Worker {
                     None,
                 )
             } else {
-                self.emit(Event::Media {
+                self.downloaded(
                     chat,
-                    message: id,
-                    result: Err("This message has no downloadable file".to_owned()),
-                });
+                    id,
+                    Err("This message has no downloadable file".to_owned()),
+                );
                 return;
             };
         if attachment_is_too_large(downloadable.file_length()) {
@@ -3547,6 +3623,7 @@ impl Worker {
         if let Ok(path) = &result {
             let _ = self.archive.set_media_path(&chat, &id, path);
         }
+        self.downloads.remove(&(chat.clone(), id.clone()));
         let for_picker = self.sticker_downloads.remove(&(chat.clone(), id.clone()));
         self.emit(Event::Media {
             chat,
@@ -5612,6 +5689,37 @@ mod tests {
     }
 
     #[test]
+    fn attachment_staging_files_are_hidden_and_exclusive() {
+        let directory = std::env::temp_dir().join(format!(
+            "zapfast-attachment-staging-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).expect("creates staging directory");
+        let destination = directory.join("photo.jpg");
+        let (first_path, first) = temporary_attachment_file(&destination).expect("first file");
+        let (second_path, second) = temporary_attachment_file(&destination).expect("second file");
+        assert_ne!(first_path, second_path);
+        assert!(
+            first_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with('.')
+        );
+        assert!(!destination.exists());
+        drop((first, second));
+        std::fs::write(&destination, b"complete attachment").expect("writes completed file");
+        discard_attachment_staging(&directory);
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+        assert_eq!(
+            std::fs::read(&destination).expect("reads completed file"),
+            b"complete attachment"
+        );
+        std::fs::remove_dir_all(&directory).expect("removes staging directory");
+    }
+
+    #[test]
     fn media_paths_keep_document_names_and_map_mimes() {
         let dir = Path::new("/cache");
         assert_eq!(
@@ -5983,6 +6091,7 @@ mod receipt_tests {
             pending_avatars: HashMap::new(),
             sticker_fetches: HashSet::new(),
             sticker_downloads: HashSet::new(),
+            downloads: HashSet::new(),
             read_sync: ReadSync::default(),
             poll_decrypting: 0,
             poll_history: Default::default(),
