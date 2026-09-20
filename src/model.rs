@@ -430,10 +430,11 @@ fn with_caption(label: &str, caption: &Option<String>) -> String {
     }
 }
 
-/// Attachment metadata, download state, and optional local file. Download keys
-/// remain in the archive's raw message.
+/// Maximum size accepted for a downloaded attachment.
 pub(crate) const ATTACHMENT_DOWNLOAD_LIMIT: u64 = 64 * 1024 * 1024;
 
+/// Attachment metadata, download state, and optional local file. Download keys
+/// remain in the archive's raw message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Media {
     pub mime: String,
