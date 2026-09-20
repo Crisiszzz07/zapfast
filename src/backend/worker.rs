@@ -3015,20 +3015,7 @@ impl Worker {
                     self.emit(Event::Error(format!("Message not sent: {error}")));
                 }
             }
-            Command::Downloaded { chat, id, result } => {
-                if let Ok(path) = &result {
-                    let _ = self.archive.set_media_path(&chat, &id, path);
-                }
-                let for_picker = self.sticker_downloads.remove(&(chat.clone(), id.clone()));
-                self.emit(Event::Media {
-                    chat,
-                    message: id,
-                    result,
-                });
-                if for_picker {
-                    self.emit_stickers();
-                }
-            }
+            Command::Downloaded { chat, id, result } => self.downloaded(chat, id, result),
             Command::AvatarFetched { id, full, path } => {
                 self.emit(Event::Avatar { id, full, path })
             }
@@ -3440,11 +3427,7 @@ impl Worker {
                 return;
             };
         if attachment_is_too_large(downloadable.file_length()) {
-            self.emit(Event::Media {
-                chat,
-                message: id,
-                result: Err(ATTACHMENT_LIMIT_ERROR.to_owned()),
-            });
+            self.downloaded(chat, id, Err(ATTACHMENT_LIMIT_ERROR.to_owned()));
             return;
         }
         // Keep metadata needed for one media re-upload request and retry.
@@ -3557,6 +3540,22 @@ impl Worker {
             };
             let _ = commands.send(Command::Downloaded { chat, id, result });
         });
+    }
+
+    /// Files the result and releases any picker request that started it.
+    fn downloaded(&mut self, chat: ChatId, id: String, result: Result<PathBuf, String>) {
+        if let Ok(path) = &result {
+            let _ = self.archive.set_media_path(&chat, &id, path);
+        }
+        let for_picker = self.sticker_downloads.remove(&(chat.clone(), id.clone()));
+        self.emit(Event::Media {
+            chat,
+            message: id,
+            result,
+        });
+        if for_picker {
+            self.emit_stickers();
+        }
     }
 
     /// Downloads missing recent and archived stickers for the picker.
